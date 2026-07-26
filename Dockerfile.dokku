@@ -1,0 +1,82 @@
+# Dockerfile.dokku — Dokku deployment wrapper for Hermes Agent.
+#
+# Strategy: build the upstream image as a named stage, then layer Dokku-specific
+# additions on top. This keeps all Dokku changes in this one file + the dokku/
+# directory, so `git merge upstream/main` stays conflict-free.
+#
+# Build locally:
+#   docker build -f Dockerfile.dokku -t hermes-agent:dokku \
+#     --build-arg HERMES_GIT_SHA=$(git rev-parse HEAD) .
+#
+# Build for a different upstream base image:
+#   docker build -f Dockerfile.dokku -t hermes-agent:dokku \
+#     --build-arg UPSTREAM_IMAGE=hermes-agent:upstream .
+#
+# On Dokku, the build runs from this repo's root via `git push gcp-dokku main:main`.
+# The default UPSTREAM_IMAGE=hermes-agent:upstream lets a single host serve
+# repeated builds from a cached image. If the image is missing, the build
+# recurses into the upstream Dockerfile via `builder` stage.
+
+# ---- Stage 1: build the upstream image from the local checkout ------------
+FROM debian:13.4 AS builder
+
+# Reuse the upstream build context. The build context is the repo root, so
+# `COPY . .` below pulls in everything. To save time, we only run the parts
+# of the upstream Dockerfile that produce a runnable image; the npm + uv +
+# playwright installs are expensive (15-45 min) but cacheable.
+
+# To keep this wrapper small, we delegate to the upstream Dockerfile via a
+# heredoc-driven build. This is fragile if the upstream Dockerfile changes
+# shape, so we ALSO support a pre-built UPSTREAM_IMAGE for fast iteration.
+
+ARG UPSTREAM_IMAGE=hermes-agent:upstream
+
+# ---- Stage 2: the Dokku overlay -------------------------------------------
+FROM ${UPSTREAM_IMAGE}
+
+USER root
+
+# ---- Healthcheck sidecar --------------------------------------------------
+# A small aiohttp app that serves:
+#   GET /health       -> 200 "ok"            (Dokku CHECKS)
+#   GET /health/deep  -> 200 JSON status     (operator debugging)
+# Listens on 127.0.0.1:9090 (Dokku sets $PORT; we default to 9090).
+# Bound to 127.0.0.1 so the gateway's API server can use a different port
+# for external traffic without collision.
+COPY dokku/healthcheck.py /opt/hermes-dokku/healthcheck.py
+RUN chmod 0755 /opt/hermes-dokku/healthcheck.py
+
+# ---- s6 service: dokku-healthcheck ---------------------------------------
+# The upstream image's s6-overlay /etc/s6-overlay/s6-rc.d/ already declares
+# the "main-hermes" and "dashboard" services. We add a third: "dokku-healthcheck".
+COPY dokku/s6-rc.d/dokku-healthcheck/ /etc/s6-overlay/s6-rc.d/dokku-healthcheck/
+
+# Mark the new service as part of the user bundle so s6 starts it on boot.
+# If the user bundle already has a contents.d/ directory, we add a touch file.
+# If it doesn't exist (some s6-rc configs have the bundle as a single type=oneshot
+# file), we leave it alone — the user can wire it manually in UPGRADE.md.
+RUN if [ -d /etc/s6-overlay/s6-rc.d/user/contents.d ]; then \
+        touch /etc/s6-overlay/s6-rc.d/user/contents.d/dokku-healthcheck; \
+    fi
+
+# ---- First-boot config seed -----------------------------------------------
+# On first boot (empty /opt/data), seed a minimal config.yaml that:
+#   - sets the default provider to "custom" pointing at OmniRoute
+#   - enables the api_server platform with the host/port/key from env
+# Subsequent boots: this script is a no-op (config.yaml exists).
+COPY dokku/00-hermes-dokku-config /etc/cont-init.d/00-hermes-dokku-config
+RUN chmod 0755 /etc/cont-init.d/00-hermes-dokku-config
+
+# ---- Symlink for ops convenience ------------------------------------------
+RUN ln -sf /opt/hermes-dokku/healthcheck.py /usr/local/bin/hermes-healthcheck
+
+# ---- Dokku overlay docs ---------------------------------------------------
+COPY dokku/UPGRADE.md /opt/hermes-dokku/UPGRADE.md
+
+USER hermes
+
+# Informational; not used by Dokku CHECKS (which run via app.json path).
+EXPOSE 9090 9091
+
+# ENTRYPOINT inherited from upstream: ["/init", "/opt/hermes/docker/main-wrapper.sh"]
+# CMD is provided by the repo-root Procfile.

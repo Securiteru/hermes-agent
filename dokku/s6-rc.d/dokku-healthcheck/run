@@ -1,0 +1,6 @@
+#!/command/with-contenv sh
+# dokku-healthcheck s6 run script.
+# Runs the stdlib-only HTTP healthcheck sidecar on $HEALTHCHECK_PORT (default 9090).
+# Bound to 127.0.0.1 — the gateway's API server binds 0.0.0.0 on a different
+# port ($API_SERVER_PORT, default 9091) for external traffic.
+exec /usr/local/bin/hermes-healthcheck
