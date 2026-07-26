@@ -84,7 +84,8 @@ gateway:
     cors_origins: ""
 
 platforms:
-${TELEGRAM_BLOCK}YAML
+${TELEGRAM_BLOCK}
+YAML
 
 # Fix ownership (the file is created as root in cont-init.d; the hermes
 # user owns it after chown). Idempotent on subsequent boots because we
