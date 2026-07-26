@@ -4113,6 +4113,25 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # YAML 1.1 parses bare `off` as boolean False — normalise to string.
         _raw_tp = CLI_CONFIG["display"].get("tool_progress", "all")
         self.tool_progress_mode = "off" if _raw_tp is False else str(_raw_tp)
+        # focus_view: display-only reduced-output mode (/focus). When on, the
+        # tool-progress mode is snapped to "off" so the EXISTING suppression
+        # path hides per-tool lines, and the pre-focus mode is stashed so
+        # /focus off restores it. Purely cosmetic — never changes what is sent
+        # to the model. See hermes_cli/focus_view.py.
+        self._focus_view_enabled = bool(CLI_CONFIG["display"].get("focus_view", False))
+        self._focus_saved_tool_progress = None
+        self._focus_hidden_lines = 0
+        self._focus_last_counted_tool = None
+        if self._focus_view_enabled:
+            from hermes_cli.focus_view import (
+                FOCUS_TOOL_PROGRESS_MODE,
+                normalize_tool_progress_mode,
+            )
+
+            self._focus_saved_tool_progress = normalize_tool_progress_mode(
+                self.tool_progress_mode
+            )
+            self.tool_progress_mode = FOCUS_TOOL_PROGRESS_MODE
         # resume_display: "full" (show history) | "minimal" (one-liner only)
         self.resume_display = CLI_CONFIG["display"].get("resume_display", "full")
         # bell_on_complete: play terminal bell (\a) when agent finishes a response
@@ -5074,7 +5093,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "active_background_subagents": 0,
             "battery_label": "",
             "battery_category": "dim",
+            # Focus view badge (/focus). Persistent indicator so the reduced
+            # output mode is never invisible. Display-only.
+            "focus_label": "",
         }
+
+        try:
+            from hermes_cli.focus_view import focus_statusbar_segment
+
+            snapshot["focus_label"] = focus_statusbar_segment(
+                bool(getattr(self, "_focus_view_enabled", False))
+            )
+        except Exception:
+            pass
 
         # Battery read-out (first status-bar element when enabled). Reads are
         # memoised for a few seconds inside agent.battery, so polling it on
@@ -5574,10 +5605,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             duration_label = snapshot["duration"]
             battery_label = snapshot.get("battery_label") or ""
             battery_prefix = f"{battery_label} │ " if battery_label else ""
+            focus_label = snapshot.get("focus_label") or ""
 
             yolo_active = self._is_session_yolo_active()
             if width < 52:
                 text = f"{battery_prefix}⚕ {snapshot['model_short']} · {duration_label}"
+                if focus_label:
+                    text += f" · {focus_label}"
                 if yolo_active:
                     text += " · ⚠ YOLO"
                 return self._trim_status_bar_text(text, width)
@@ -5598,6 +5632,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 if bg_subagent_count:
                     parts.append(f"⛓ {bg_subagent_count}")
                 parts.append(duration_label)
+                if focus_label:
+                    parts.append(focus_label)
                 if yolo_active:
                     parts.append("⚠ YOLO")
                 return self._trim_status_bar_text(" · ".join(parts), width)
@@ -5631,6 +5667,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             idle_since = snapshot.get("idle_since")
             if idle_since:
                 parts.append(idle_since)
+            if focus_label:
+                parts.append(focus_label)
             if yolo_active:
                 parts.append("⚠ YOLO")
             return self._trim_status_bar_text(" │ ".join(parts), width)
@@ -5652,6 +5690,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             yolo_active = self._is_session_yolo_active()
             battery_label = snapshot.get("battery_label") or ""
             battery_style = self._battery_status_style(snapshot.get("battery_category", "dim"))
+            focus_label = snapshot.get("focus_label") or ""
 
             if width < 52:
                 frags = [
@@ -5660,6 +5699,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     ("class:status-bar-dim", " · "),
                     ("class:status-bar-dim", duration_label),
                 ]
+                if focus_label:
+                    frags.append(("class:status-bar-dim", " · "))
+                    frags.append(("class:status-bar-strong", focus_label))
                 if yolo_active:
                     frags.append(("class:status-bar-dim", " · "))
                     frags.append(("class:status-bar-yolo", "⚠ YOLO"))
@@ -5694,6 +5736,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         ("class:status-bar-dim", " · "),
                         ("class:status-bar-dim", duration_label),
                     ])
+                    if focus_label:
+                        frags.append(("class:status-bar-dim", " · "))
+                        frags.append(("class:status-bar-strong", focus_label))
                     if yolo_active:
                         frags.append(("class:status-bar-dim", " · "))
                         frags.append(("class:status-bar-yolo", "⚠ YOLO"))
@@ -5747,6 +5792,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     if idle_since:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append(("class:status-bar-dim", idle_since))
+                    # Persistent focus-view badge — so the reduced-output mode
+                    # is never invisible (mirrors the YOLO badge convention).
+                    if focus_label:
+                        frags.append(("class:status-bar-dim", " │ "))
+                        frags.append(("class:status-bar-strong", focus_label))
                     if yolo_active:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append(("class:status-bar-yolo", "⚠ YOLO"))
@@ -9482,6 +9532,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._handle_timestamps_command(cmd_original)
         elif canonical == "verbose":
             self._toggle_verbose()
+        elif canonical == "focus":
+            self._handle_focus_command(cmd_original)
         elif canonical == "footer":
             self._handle_footer_command(cmd_original)
         elif canonical == "yolo":
@@ -10139,6 +10191,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         except ValueError:
             idx = 2  # default to "all"
         self.tool_progress_mode = cycle[(idx + 1) % len(cycle)]
+
+        # /verbose is the explicit tool-progress control, so cycling it takes
+        # ownership of the mode back from focus view. Leaving _focus_view_enabled
+        # set would show a "focus" status-bar badge and hidden-line counts while
+        # tool lines were visibly printing. Display-only state change.
+        if getattr(self, "_focus_view_enabled", False):
+            self._focus_view_enabled = False
+            self._focus_saved_tool_progress = None
+            self._focus_hidden_lines = 0
+            self._focus_last_counted_tool = None
+            try:
+                from hermes_cli.focus_view import FOCUS_CONFIG_KEY
+
+                save_config_value(FOCUS_CONFIG_KEY, False)
+            except Exception:
+                pass
 
         if self.agent:
             self.agent.reasoning_callback = self._current_reasoning_callback()
@@ -11249,6 +11317,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         if event_type == "tool.completed":
             self._tool_start_time = 0.0
+            # Focus view: count the scrollback line we are NOT printing, so the
+            # post-turn recovery line can report how much was hidden. Counted
+            # against the pre-focus tool-progress mode, so a user who already
+            # had /verbose off is never told focus hid something it didn't.
+            if getattr(self, "_focus_view_enabled", False):
+                try:
+                    self._note_focus_hidden_line(function_name or "")
+                except Exception:
+                    pass
             # Print stacked scrollback line for "new" / "all" / "verbose" modes.
             # "verbose" was previously omitted here, so non-streaming model
             # calls (MoA aggregator, copilot-acp) rendered each tool only into
@@ -13118,6 +13195,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     except Exception:
                         pass
 
+
+            # Focus view: dim recovery line reporting what was hidden this turn
+            # (and how to reveal it). Printed after the response so the turn
+            # reads prompt → answer → "⋯ N tool lines hidden". Display-only;
+            # resets the counter for the next turn.
+            try:
+                self._emit_focus_recovery_line()
+            except Exception:
+                pass
 
             # Play terminal bell when agent finishes (if enabled).
             # Works over SSH — the bell propagates to the user's terminal.
