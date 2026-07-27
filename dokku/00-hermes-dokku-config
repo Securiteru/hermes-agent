@@ -1,4 +1,4 @@
-#!/command/with-contenv sh
+#!/bin/sh
 # Hermes Agent — Dokku first-boot config seed.
 # Runs as a s6 cont-init.d hook (BEFORE user services start).
 #
