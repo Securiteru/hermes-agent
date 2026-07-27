@@ -67,7 +67,7 @@ COPY dokku/UPGRADE.md /opt/hermes-dokku/UPGRADE.md
 USER hermes
 
 # Informational; not used by Dokku CHECKS (which run via app.json path).
-EXPOSE 5000 9091
+EXPOSE 9091
 
 # Override the upstream ENTRYPOINT (which assumed PID 1). The init wrapper
 # runs cont-init.d scripts, starts the healthcheck sidecar, then execs

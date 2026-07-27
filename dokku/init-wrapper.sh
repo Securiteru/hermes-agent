@@ -73,16 +73,23 @@ echo "[hermes-dokku-init] running 00-hermes-dokku-config (config.yaml seed)"
 /etc/cont-init.d/00-hermes-dokku-config
 
 # --- Stage 3: healthcheck sidecar ---
-# Bind 127.0.0.1:9090. Stays in the background; if it dies, Dokku's
-# healthcheck will fail and Dokku will restart the container (per
-# `on-failure:10` policy).
-echo "[hermes-dokku-init] starting healthcheck sidecar"
-/usr/local/bin/hermes-healthcheck &
-HEALTHCHECK_PID=$!
-echo "[hermes-dokku-init] healthcheck pid: $HEALTHCHECK_PID"
-
-# Trap signals to clean up the healthcheck on shutdown.
-trap 'echo "[hermes-dokku-init] shutting down"; kill -TERM $HEALTHCHECK_PID 2>/dev/null; exit 0' TERM INT
+# The gateway's built-in API server has its own /health endpoint that returns
+# {"status":"ok"}. If the healthcheck sidecar port (HEALTHCHECK_PORT) differs
+# from the gateway API port (API_SERVER_PORT), start the sidecar for /health/deep.
+# If they're the same port (Dokku proxy maps to the gateway directly), skip the
+# sidecar — the gateway's own /health endpoint suffices.
+HC_PORT=${HEALTHCHECK_PORT:-9090}
+GW_PORT=${API_SERVER_PORT:-9091}
+if [ "$HC_PORT" != "$GW_PORT" ]; then
+    echo "[hermes-dokku-init] starting healthcheck sidecar on $HC_PORT"
+    /usr/local/bin/hermes-healthcheck &
+    HEALTHCHECK_PID=$!
+    echo "[hermes-dokku-init] healthcheck pid: $HEALTHCHECK_PID"
+    # Trap signals to clean up the healthcheck on shutdown.
+    trap 'echo "[hermes-dokku-init] shutting down"; kill -TERM $HEALTHCHECK_PID 2>/dev/null; exit 0' TERM INT
+else
+    echo "[hermes-dokku-init] healthcheck sidecar skipped (gateway /health on port $GW_PORT)"
+fi
 
 # --- Stage 4: exec the gateway in the foreground ---
 # main-wrapper.sh handles arg routing and drops to the hermes user via
