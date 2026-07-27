@@ -20,6 +20,7 @@ import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(os.environ.get("HEALTHCHECK_PORT", "9090"))
+BIND_HOST = os.environ.get("HEALTHCHECK_HOST", "0.0.0.0")
 GATEWAY_API_PORT = int(os.environ.get("API_SERVER_PORT", "9091"))
 
 
@@ -95,8 +96,8 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    server = ThreadingHTTPServer(("127.0.0.1", PORT), HealthHandler)
-    print(f"[hermes-healthcheck] listening on 127.0.0.1:{PORT}", flush=True)
+    server = ThreadingHTTPServer((BIND_HOST, PORT), HealthHandler)
+    print(f"[hermes-healthcheck] listening on {BIND_HOST}:{PORT}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
