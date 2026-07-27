@@ -1,4 +1,0 @@
-WAIT=30
-TIMEOUT=90
-ATTEMPTS=10
-/health ok

@@ -8,18 +8,12 @@
     "web": [
       {
         "type": "startup",
+        "name": "check-1",
         "path": "/health",
         "attempts": 10,
         "wait": 30,
         "timeout": 90,
         "content": "ok"
-      },
-      {
-        "type": "uptime",
-        "path": "/health",
-        "attempts": 3,
-        "wait": 5,
-        "timeout": 30
       }
     ]
   }
