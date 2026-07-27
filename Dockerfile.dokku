@@ -20,7 +20,7 @@
 #   docker build -t hermes-agent:upstream --build-arg HERMES_GIT_SHA=$(git rev-parse HEAD) .
 #   docker build -f Dockerfile.dokku -t hermes-agent:dokku .
 
-ARG UPSTREAM_IMAGE=hermes-agent:upstream
+ARG UPSTREAM_IMAGE=localhost/hermes-agent:upstream
 
 # ---- Stage 1: build the upstream image from the local checkout ------------
 FROM debian:13.4 AS builder
