@@ -91,11 +91,103 @@ psst OMNIROUTE_API_KEY -- ssh dokku@100.100.104.101 \
 psst TELEGRAM_BOT_TOKEN -- ssh dokku@100.100.104.101 \
     "dokku config:set --no-restart hermes-agent TELEGRAM_BOT_TOKEN=\$TELEGRAM_BOT_TOKEN"
 
+# Allow the Docker bridge to reach OmniRoute through the helper's Tailscale IP.
+# This is host-local traffic to a Tailscale address; it does not open port 20128
+# to the public interface. Run on agent-helper, or use dokku/allow-omniroute-tailscale.sh.
+sudo ufw allow from 172.17.0.0/16 to 100.73.253.25 \
+    port 20128 proto tcp comment 'Hermes to OmniRoute via Tailscale'
+
 # 7. Add the Dokku remote and deploy
 git remote add gcp-dokku dokku@100.100.104.101:hermes-agent
 git push gcp-dokku main:main
 
+# Optional Tailscale-only dashboard companion. Configure basic auth before
+# starting it; PASSWORD_HASH is preferred over storing plaintext in Dokku:
+dokku config:set --no-restart hermes-agent \
+    HERMES_DASHBOARD=1 \
+    HERMES_DASHBOARD_HOST=0.0.0.0 \
+    HERMES_DASHBOARD_PORT=9119 \
+    HERMES_DASHBOARD_BASIC_AUTH_USERNAME=admin \
+    HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH='<scrypt hash>' \
+    HERMES_DASHBOARD_BASIC_AUTH_SECRET='<random signing secret>'
+dokku ports:add hermes-agent http:9091:9091
+dokku ports:add hermes-agent http:9119:9119
+# Run on the host; public ingress remains denied.
+./dokku/allow-hermes-webui-tailscale.sh
+```
+
+## Run both browser UIs in the Hermes image (preferred)
+
+The custom browser UI is a separate project from Hermes Agent's built-in
+dashboard: [`nesquena/hermes-webui`](https://github.com/nesquena/hermes-webui).
+`Dockerfile.dokku` copies the pinned UI release into the Hermes image and
+installs its dependencies into the sealed Hermes virtualenv. Enable it as a
+companion process so one Dokku app owns the API and both browser UIs:
+
+```bash
+dokku config:set --no-restart hermes-agent \
+    HERMES_WEBUI=1 \
+    HERMES_WEBUI_HOST=0.0.0.0 \
+    HERMES_WEBUI_PORT=8787 \
+    HERMES_WEBUI_STATE_DIR=/opt/data/webui \
+    HERMES_WEBUI_DEFAULT_WORKSPACE=/opt/data/workspace \
+    HERMES_WEBUI_AGENT_DIR=/opt/hermes \
+    HERMES_WEBUI_CHAT_BACKEND=api_server \
+    HERMES_WEBUI_GATEWAY_BASE_URL=http://127.0.0.1:9091
+dokku ports:add hermes-agent http:8787:8787
+./dokku/allow-hermes-webui-tailscale.sh
+```
+
+Set `HERMES_WEBUI_PASSWORD` from `psst`. The wrapper defaults
+`HERMES_WEBUI_GATEWAY_API_KEY` to `API_SERVER_KEY`; do not duplicate the key
+unless the deployment needs a separate secret. Verify `8787`, `9091`, and
+`9119` through Tailscale and confirm the public host address times out.
+
+## Alternative: run a separate `hermes-webui` rollback app
+
+The custom browser UI is a separate project from Hermes Agent's built-in
+dashboard: [`nesquena/hermes-webui`](https://github.com/nesquena/hermes-webui).
+Run it as its own Dokku app only when a separate rollback/container is needed;
+do not confuse its port with the built-in dashboard on `9119`.
+
+```bash
+# Build the pinned upstream UI image with the editable-install compatibility
+# patch used by Hermes Agent's sealed source tree.
+docker build -f dokku/Dockerfile.hermes-webui \
+    -t hermes-webui:VERSION-dokku .
+
+dokku apps:create hermes-webui
+dokku config:set hermes-webui \
+    HERMES_HOME=/home/hermeswebui/.hermes \
+    HERMES_WEBUI_HOST=0.0.0.0 \
+    HERMES_WEBUI_PORT=8787 \
+    HERMES_WEBUI_STATE_DIR=/home/hermeswebui/.hermes/webui \
+    HERMES_WEBUI_AGENT_DIR=/home/hermeswebui/.hermes/hermes-agent \
+    HERMES_WEBUI_DEFAULT_WORKSPACE=/home/hermeswebui/.hermes/workspace \
+    HERMES_WEBUI_CHAT_BACKEND=api_server \
+    HERMES_WEBUI_GATEWAY_BASE_URL=http://100.73.253.25:9091 \
+    HERMES_WEBUI_GATEWAY_API_KEY='<psst HERMES_API_SERVER_KEY>' \
+    HERMES_WEBUI_PASSWORD='<psst HERMES_WEBUI_PASSWORD>'
+dokku storage:mount hermes-webui \
+    /var/lib/dokku/data/storage/hermes-agent:/home/hermeswebui/.hermes
+dokku storage:mount hermes-webui \
+    /var/lib/dokku/data/storage/hermes-webui-agent-src:/home/hermeswebui/.hermes/hermes-agent
+dokku ports:add hermes-webui http:8787:8787
+./dokku/allow-hermes-webui-tailscale.sh
+
+# The UI container reaches the API server over the helper's Tailscale address;
+# this bridge-only rule is required in addition to the Tailscale client rule.
+sudo ufw allow from 172.17.0.0/16 to 100.73.253.25 \
+    port 9091 proto tcp comment 'Hermes WebUI to API via Tailscale'
+
+dokku git:from-image hermes-webui hermes-webui:VERSION-dokku
+```
+
+Verify `GET /health` and a real chat through `http://100.73.253.25:8787`.
+The public host address must time out on `8787`, `9091`, and `9119`.
+
 # 8. Verify
+```bash
 ssh dokku@100.100.104.101 'dokku ps:report hermes-agent'
 ssh dokku@100.100.104.101 'dokku logs hermes-agent -t'
 curl -sS http://100.100.104.101:9091/v1/models \

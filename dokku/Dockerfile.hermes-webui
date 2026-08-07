@@ -1,0 +1,13 @@
+# Hermes WebUI sidecar for the Dokku Hermes Agent deployment.
+#
+# The upstream WebUI image's two-container bootstrap installs the mounted
+# Hermes Agent source as a wheel. Hermes Agent intentionally disallows wheel
+# builds, so use its supported editable-install path instead.
+
+FROM ghcr.io/nesquena/hermes-webui@sha256:28783c1ec13cda2f65ec1249a8537d3b9353fcfe5f97f4d24865ab524d26815d
+
+USER root
+
+RUN sed -i 's|uv pip install "\$_stage_src\[all\]"|uv pip install -e "\$_stage_src[all]"|' /hermeswebui_init.bash
+
+USER root

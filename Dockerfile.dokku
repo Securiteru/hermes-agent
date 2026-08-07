@@ -21,6 +21,7 @@
 #   docker build -f Dockerfile.dokku -t hermes-agent:dokku .
 
 ARG UPSTREAM_IMAGE=localhost/hermes-agent:upstream
+ARG WEBUI_IMAGE=ghcr.io/nesquena/hermes-webui@sha256:28783c1ec13cda2f65ec1249a8537d3b9353fcfe5f97f4d24865ab524d26815d
 
 # ---- Stage 1: build the upstream image from the local checkout ------------
 FROM debian:13.4 AS builder
@@ -28,6 +29,9 @@ FROM debian:13.4 AS builder
 # Stage 1 is reserved for a future where we want to do the upstream build
 # from this Dockerfile. Today, we expect UPSTREAM_IMAGE to be built
 # separately and cached (faster iteration on the overlay).
+
+# ---- Stage 1b: source for the custom browser UI ---------------------------
+FROM ${WEBUI_IMAGE} AS hermes_webui_source
 
 # ---- Stage 2: the Dokku overlay -------------------------------------------
 FROM ${UPSTREAM_IMAGE}
@@ -56,6 +60,18 @@ RUN ln -sf /opt/hermes-dokku/healthcheck.py /usr/local/bin/hermes-healthcheck
 COPY dokku/00-hermes-dokku-config /etc/cont-init.d/00-hermes-dokku-config
 RUN chmod 0755 /etc/cont-init.d/00-hermes-dokku-config
 
+# ---- Embedded custom WebUI ------------------------------------------------
+# The WebUI image stores its application under /apptoo. Keep its source and
+# dependencies in the Hermes image so one Dokku app can run both browser UIs.
+COPY --from=hermes_webui_source /apptoo/ /opt/hermes-webui/
+RUN /usr/local/bin/uv pip install \
+        --python /opt/hermes/.venv/bin/python \
+        -r /opt/hermes-webui/requirements.txt \
+        --trusted-host pypi.org \
+        --trusted-host files.pythonhosted.org && \
+    chown -R root:root /opt/hermes-webui && \
+    chmod -R a-w /opt/hermes-webui
+
 # ---- Dokku overlay docs ---------------------------------------------------
 COPY dokku/UPGRADE.md /opt/hermes-dokku/UPGRADE.md
 
@@ -67,7 +83,10 @@ COPY dokku/UPGRADE.md /opt/hermes-dokku/UPGRADE.md
 USER hermes
 
 # Informational; not used by Dokku CHECKS (which run via app.json path).
-EXPOSE 9091
+ENV HERMES_WEBUI_DIR=/opt/hermes-webui \
+    HERMES_WEBUI_PYTHON=/opt/hermes/.venv/bin/python
+
+EXPOSE 8787 9091 9119
 
 # Override the upstream ENTRYPOINT (which assumed PID 1). The init wrapper
 # runs cont-init.d scripts, starts the healthcheck sidecar, then execs
