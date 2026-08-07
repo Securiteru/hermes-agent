@@ -1,0 +1,158 @@
+#!/bin/sh
+# Hermes Agent — Dokku init wrapper.
+#
+# Replaces s6-overlay's /init (which can't run as a child of Dokku's
+# process supervisor) with a minimal init that:
+#
+#   1. Adds /command to PATH (s6 binaries live there; normally prepended
+#      by /init, which we're bypassing).
+#   2. Pre-creates /run/s6 and chowns it to hermes (the gateway runtime
+#      writes session state there).
+#   3. Runs the upstream stage2-hook.sh (UID remap, /opt/data chown, etc.)
+#      directly. This script uses #!/bin/sh and standard tools; its only
+#      s6 dependency is `s6-setuidgid`, which we just made discoverable.
+#   4. Runs my own 00-hermes-dokku-config (config.yaml seed).
+#   5. Starts the healthcheck sidecar in the background.
+#   6. Execs the gateway as the foreground process.
+#
+# Skipped (s6-only, not needed without s6):
+#   - /etc/cont-init.d/01-hermes-setup        (just execs stage2-hook.sh)
+#   - /etc/cont-init.d/015-supervise-perms    (chowns s6 supervise/ trees)
+#   - /etc/cont-init.d/02-reconcile-profiles  (recreates per-profile s6 services)
+#   - /etc/s6-overlay/s6-rc.d/                (s6-rc user bundle)
+
+set -e
+
+# --- PATH + /run/s6 prep (replaces what /init would have done) ---
+# s6 binaries (s6-setuidgid, execlineb, with-contenv, etc.) live in /command.
+# /init normally prepends /command to PATH; we do it explicitly here so the
+# upstream stage2-hook.sh's `s6-setuidgid hermes ...` calls resolve.
+export PATH="/command:${PATH}"
+
+# S6_KEEP_ENV=1 tells /command/with-contenv (the shebang on main-wrapper.sh
+# and the upstream cont-init.d scripts) to KEEP the current process environment
+# instead of clearing it and loading from /run/s6/container_environment (which
+# only exists when /init runs as PID 1). Without this, with-contenv fails with
+# "s6-envdir: fatal: unable to envdir /run/s6/container_environment: No such
+# file or directory" and the gateway can't start.
+export S6_KEEP_ENV=1
+
+# /run/s6 is the s6-overlay runtime state directory. Without /init running,
+# it doesn't exist; some upstream code paths still mkdir under it. Pre-create
+# as root, then chown to the hermes user so the privilege-dropped process
+# can write to it.
+mkdir -p /run/s6 /run/service 2>/dev/null || true
+chown -R hermes:hermes /run/s6 /run/service 2>/dev/null || true
+
+# --- Stage 1: UID remap + /opt/data chown ---
+# The upstream stage2-hook.sh does all the cont-init work in one pass:
+#   - validates HERMES_UID/HERMES_GID and remaps the hermes user
+#   - creates /opt/data subdirs and chowns them
+#   - runs docker_config_migrate.py
+#   - writes s6 container_environment (we don't need this, but it's a no-op)
+#
+# Some sub-operations inside stage2-hook.sh fail under Dokku's process
+# supervisor (e.g. s6-applyuidgid can't set supplementary groups without
+# elevated caps). The script is designed to be mostly-idempotent and
+# tolerant of partial failures, so we run it WITHOUT `set -e` here and
+# log the exit code for diagnostics.
+echo "[hermes-dokku-init] running stage2-hook.sh (UID remap, /opt/data chown)"
+if /opt/hermes/docker/stage2-hook.sh; then
+    echo "[hermes-dokku-init] stage2-hook.sh OK"
+else
+    rc=$?
+    echo "[hermes-dokku-init] stage2-hook.sh exited $rc (continuing — most sub-ops are non-fatal)"
+fi
+
+# Re-assert /run/s6 + /run/service ownership in case stage2-hook reset them.
+mkdir -p /run/s6 /run/service 2>/dev/null || true
+chown -R hermes:hermes /run/s6 /run/service 2>/dev/null || true
+
+# --- Stage 2: first-boot config seed ---
+echo "[hermes-dokku-init] running 00-hermes-dokku-config (config.yaml seed)"
+/etc/cont-init.d/00-hermes-dokku-config
+
+# --- Stage 3: optional custom WebUI + built-in dashboard -------------------
+# The custom browser UI is baked into the same image at /opt/hermes-webui.
+# It uses the Hermes API server over loopback, defaulting its API key to the
+# already-required API_SERVER_KEY so no duplicate secret is needed.
+if [ "${HERMES_WEBUI:-0}" = "1" ]; then
+    WEBUI_DIR=${HERMES_WEBUI_DIR:-/opt/hermes-webui}
+    WEBUI_PYTHON=${HERMES_WEBUI_PYTHON:-/opt/hermes/.venv/bin/python}
+    WEBUI_HOST=${HERMES_WEBUI_HOST:-0.0.0.0}
+    WEBUI_PORT=${HERMES_WEBUI_PORT:-8787}
+    WEBUI_STATE_DIR=${HERMES_WEBUI_STATE_DIR:-/opt/data/webui}
+    WEBUI_WORKSPACE=${HERMES_WEBUI_DEFAULT_WORKSPACE:-/opt/data/workspace}
+    WEBUI_AGENT_DIR=${HERMES_WEBUI_AGENT_DIR:-/opt/hermes}
+    WEBUI_BACKEND=${HERMES_WEBUI_CHAT_BACKEND:-api_server}
+    WEBUI_GATEWAY_BASE_URL=${HERMES_WEBUI_GATEWAY_BASE_URL:-http://127.0.0.1:${API_SERVER_PORT:-9091}}
+    WEBUI_GATEWAY_API_KEY=${HERMES_WEBUI_GATEWAY_API_KEY:-${API_SERVER_KEY:-}}
+    if [ -x "$WEBUI_PYTHON" ] && [ -f "$WEBUI_DIR/server.py" ]; then
+        mkdir -p "$WEBUI_STATE_DIR" "$WEBUI_WORKSPACE" 2>/dev/null || true
+        echo "[hermes-dokku-init] starting custom WebUI on ${WEBUI_HOST}:${WEBUI_PORT}"
+        (
+            while :; do
+                HERMES_HOME="${HERMES_HOME:-/opt/data}" \
+                HERMES_WEBUI_HOST="$WEBUI_HOST" \
+                HERMES_WEBUI_PORT="$WEBUI_PORT" \
+                HERMES_WEBUI_STATE_DIR="$WEBUI_STATE_DIR" \
+                HERMES_WEBUI_DEFAULT_WORKSPACE="$WEBUI_WORKSPACE" \
+                HERMES_WEBUI_AGENT_DIR="$WEBUI_AGENT_DIR" \
+                HERMES_WEBUI_CHAT_BACKEND="$WEBUI_BACKEND" \
+                HERMES_WEBUI_GATEWAY_BASE_URL="$WEBUI_GATEWAY_BASE_URL" \
+                HERMES_WEBUI_GATEWAY_API_KEY="$WEBUI_GATEWAY_API_KEY" \
+                PYTHONPATH="$WEBUI_DIR:$WEBUI_AGENT_DIR:${PYTHONPATH:-}" \
+                    "$WEBUI_PYTHON" "$WEBUI_DIR/server.py" || true
+                echo "[hermes-dokku-init] custom WebUI exited; retrying in 5s"
+                sleep 5
+            done
+        ) &
+    else
+        echo "[hermes-dokku-init] embedded WebUI files are missing; skipping custom WebUI"
+    fi
+fi
+
+# The Dokku web process remains the gateway. When HERMES_DASHBOARD=1, run the
+# dashboard as a supervised companion so its state stays shared with the
+# gateway while its separate port can be restricted to Tailscale by UFW.
+if [ "${HERMES_DASHBOARD:-0}" = "1" ]; then
+    DASHBOARD_HOST=${HERMES_DASHBOARD_HOST:-0.0.0.0}
+    DASHBOARD_PORT=${HERMES_DASHBOARD_PORT:-9119}
+    echo "[hermes-dokku-init] starting dashboard on ${DASHBOARD_HOST}:${DASHBOARD_PORT}"
+    (
+        while :; do
+            /opt/hermes/docker/main-wrapper.sh dashboard \
+                --host "$DASHBOARD_HOST" \
+                --port "$DASHBOARD_PORT" \
+                --no-open \
+                --skip-build || true
+            echo "[hermes-dokku-init] dashboard exited; retrying in 5s"
+            sleep 5
+        done
+    ) &
+fi
+
+# --- Stage 4: healthcheck sidecar -------------------------------------------
+# The gateway's built-in API server has its own /health endpoint that returns
+# {"status":"ok"}. If the healthcheck sidecar port (HEALTHCHECK_PORT) differs
+# from the gateway API port (API_SERVER_PORT), start the sidecar for /health/deep.
+# If they're the same port (Dokku proxy maps to the gateway directly), skip the
+# sidecar — the gateway's own /health endpoint suffices.
+HC_PORT=${HEALTHCHECK_PORT:-9090}
+GW_PORT=${API_SERVER_PORT:-9091}
+if [ "$HC_PORT" != "$GW_PORT" ]; then
+    echo "[hermes-dokku-init] starting healthcheck sidecar on $HC_PORT"
+    /usr/local/bin/hermes-healthcheck &
+    HEALTHCHECK_PID=$!
+    echo "[hermes-dokku-init] healthcheck pid: $HEALTHCHECK_PID"
+    # Trap signals to clean up the healthcheck on shutdown.
+    trap 'echo "[hermes-dokku-init] shutting down"; kill -TERM $HEALTHCHECK_PID 2>/dev/null; exit 0' TERM INT
+else
+    echo "[hermes-dokku-init] healthcheck sidecar skipped (gateway /health on port $GW_PORT)"
+fi
+
+# --- Stage 5: exec the gateway in the foreground ----------------------------
+# main-wrapper.sh handles arg routing and drops to the hermes user via
+# s6-setuidgid. When this exits, Dokku restarts the container.
+echo "[hermes-dokku-init] exec gateway run (foreground)"
+exec /opt/hermes/docker/main-wrapper.sh gateway run

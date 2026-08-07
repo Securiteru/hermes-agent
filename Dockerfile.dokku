@@ -1,0 +1,95 @@
+# Dockerfile.dokku — Dokku deployment wrapper for Hermes Agent.
+#
+# Strategy: build the upstream image as a named stage, then layer Dokku-specific
+# additions on top. This keeps all Dokku changes in this one file + the dokku/
+# directory, so `git merge upstream/main` stays conflict-free.
+#
+# Why an init wrapper instead of using upstream's s6-overlay:
+#   The upstream image's ENTRYPOINT is `["/init", "/opt/hermes/docker/main-wrapper.sh"]`
+#   and assumes /init runs as PID 1. Dokku runs our ENTRYPOINT as a child of
+#   its own process supervisor (chpst/runsvdir), so /init exits immediately
+#   with "s6-overlay-suexec: fatal: can only run as pid 1" and the container
+#   has no long-running process.
+#
+#   We replace /init with a minimal init (dokku/init-wrapper.sh) that:
+#     1. Runs cont-init.d scripts in order (UID remap, config seed, etc.)
+#     2. Starts the healthcheck sidecar in the background
+#     3. Execs the gateway as the foreground process (Dokku tracks this PID)
+#
+# Build locally:
+#   docker build -t hermes-agent:upstream --build-arg HERMES_GIT_SHA=$(git rev-parse HEAD) .
+#   docker build -f Dockerfile.dokku -t hermes-agent:dokku .
+
+ARG UPSTREAM_IMAGE=localhost/hermes-agent:upstream
+ARG WEBUI_IMAGE=ghcr.io/nesquena/hermes-webui@sha256:28783c1ec13cda2f65ec1249a8537d3b9353fcfe5f97f4d24865ab524d26815d
+
+# ---- Stage 1: build the upstream image from the local checkout ------------
+FROM debian:13.4 AS builder
+
+# Stage 1 is reserved for a future where we want to do the upstream build
+# from this Dockerfile. Today, we expect UPSTREAM_IMAGE to be built
+# separately and cached (faster iteration on the overlay).
+
+# ---- Stage 1b: source for the custom browser UI ---------------------------
+FROM ${WEBUI_IMAGE} AS hermes_webui_source
+
+# ---- Stage 2: the Dokku overlay -------------------------------------------
+FROM ${UPSTREAM_IMAGE}
+
+USER root
+
+# ---- Init wrapper ---------------------------------------------------------
+# Replaces the upstream s6-overlay /init (incompatible with Dokku's process
+# supervisor). Runs cont-init.d scripts + healthcheck sidecar, then execs
+# the gateway as the foreground process.
+COPY dokku/init-wrapper.sh /usr/local/bin/hermes-dokku-init
+RUN chmod 0755 /usr/local/bin/hermes-dokku-init
+
+# ---- Healthcheck sidecar --------------------------------------------------
+# Stdlib-only HTTP server on 127.0.0.1:9090. Serves:
+#   GET /health       -> 200 "ok"            (Dokku CHECKS)
+#   GET /health/deep  -> 200 JSON status     (operator debugging)
+# No aiohttp — the upstream image seals /opt/hermes and blocks lazy installs.
+COPY dokku/healthcheck.py /opt/hermes-dokku/healthcheck.py
+RUN chmod 0755 /opt/hermes-dokku/healthcheck.py
+RUN ln -sf /opt/hermes-dokku/healthcheck.py /usr/local/bin/hermes-healthcheck
+
+# ---- First-boot config seed -----------------------------------------------
+# Runs as a cont-init.d hook (BEFORE the gateway starts). Seeds
+# /opt/data/config.yaml on first boot from env vars. Idempotent.
+COPY dokku/00-hermes-dokku-config /etc/cont-init.d/00-hermes-dokku-config
+RUN chmod 0755 /etc/cont-init.d/00-hermes-dokku-config
+
+# ---- Embedded custom WebUI ------------------------------------------------
+# The WebUI image stores its application under /apptoo. Keep its source and
+# dependencies in the Hermes image so one Dokku app can run both browser UIs.
+COPY --from=hermes_webui_source /apptoo/ /opt/hermes-webui/
+RUN /usr/local/bin/uv pip install \
+        --python /opt/hermes/.venv/bin/python \
+        -r /opt/hermes-webui/requirements.txt \
+        --trusted-host pypi.org \
+        --trusted-host files.pythonhosted.org && \
+    chown -R root:root /opt/hermes-webui && \
+    chmod -R a-w /opt/hermes-webui
+
+# ---- Dokku overlay docs ---------------------------------------------------
+COPY dokku/UPGRADE.md /opt/hermes-dokku/UPGRADE.md
+
+# Drop the upstream s6-rc.d registration of the dokku-healthcheck service —
+# the init-wrapper.sh now starts the healthcheck directly. This is a no-op
+# cleanup; the healthcheck service files are still in dokku/s6-rc.d/ for
+# reference but the wrapper doesn't consult them.
+
+USER hermes
+
+# Informational; not used by Dokku CHECKS (which run via app.json path).
+ENV HERMES_WEBUI_DIR=/opt/hermes-webui \
+    HERMES_WEBUI_PYTHON=/opt/hermes/.venv/bin/python
+
+EXPOSE 8787 9091 9119
+
+# Override the upstream ENTRYPOINT (which assumed PID 1). The init wrapper
+# runs cont-init.d scripts, starts the healthcheck sidecar, then execs
+# the gateway as the foreground process.
+ENTRYPOINT ["/usr/local/bin/hermes-dokku-init"]
+# CMD is set by the repo-root Procfile at build time.

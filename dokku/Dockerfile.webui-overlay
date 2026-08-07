@@ -1,0 +1,12 @@
+# Minimal remote overlay used to refresh the Dokku image without rebuilding
+# the large upstream Hermes base image. The helper host already has the
+# current Dokku image locally, including the healthcheck and config seed.
+FROM dokku/hermes-agent:latest
+
+USER root
+COPY init-wrapper.sh /usr/local/bin/hermes-dokku-init
+RUN chmod 0755 /usr/local/bin/hermes-dokku-init
+
+USER hermes
+EXPOSE 9091 9119
+ENTRYPOINT ["/usr/local/bin/hermes-dokku-init"]

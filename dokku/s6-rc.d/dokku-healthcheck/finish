@@ -1,0 +1,4 @@
+#!/command/with-contenv sh
+# dokku-healthcheck finish script.
+# Let s6-supervise restart the healthcheck on any crash.
+exit 0
